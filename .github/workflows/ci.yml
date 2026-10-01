@@ -1,0 +1,76 @@
+name: FastAPI quality and database acceptance
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  quality:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        database: [postgresql, mysql]
+    runs-on: ${{ matrix.os }}
+    env:
+      DB_PROVIDER: ${{ matrix.database }}
+      DATABASE_URL: ${{ matrix.database == 'mysql' && 'mysql://backend:fixture-password@127.0.0.1:1/backend' || 'postgresql://backend:fixture-password@127.0.0.1:1/backend' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.3'
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: '0.12.21'
+      - run: uv sync --locked --extra ${{ matrix.database }}
+      - run: uv run --locked python scripts/verify.py
+      - run: uv export --locked --no-dev --no-emit-project --extra ${{ matrix.database }} --format requirements-txt --output-file requirements-audit.txt
+      - run: uv run --locked pip-audit --requirement requirements-audit.txt --no-deps
+  runtime:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        database: [postgresql, mysql]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.3-alpine
+        env:
+          POSTGRES_USER: backend
+          POSTGRES_PASSWORD: fixture-password
+          POSTGRES_DB: backend
+        ports: ['5432:5432']
+        options: --health-cmd "pg_isready -U backend -d backend" --health-interval 3s --health-timeout 3s --health-retries 30
+      mysql:
+        image: mysql:8.4@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242
+        env:
+          MYSQL_DATABASE: backend
+          MYSQL_USER: backend
+          MYSQL_PASSWORD: fixture-password
+          MYSQL_ROOT_PASSWORD: root-fixture-password
+        ports: ['3306:3306']
+        options: --health-cmd "mysqladmin ping -h localhost" --health-interval 3s --health-timeout 3s --health-retries 30
+    env:
+      DB_PROVIDER: ${{ matrix.database }}
+      TEST_DB_PROVIDER: ${{ matrix.database }}
+      DATABASE_URL: ${{ matrix.database == 'mysql' && 'mysql://backend:fixture-password@127.0.0.1:3306/backend' || 'postgresql://backend:fixture-password@127.0.0.1:5432/backend' }}
+      TEST_DATABASE_URL: ${{ matrix.database == 'mysql' && 'mysql://backend:fixture-password@127.0.0.1:3306/backend' || 'postgresql://backend:fixture-password@127.0.0.1:5432/backend' }}
+      JWT_SECRET: ci-only-secret-at-least-32-bytes-not-for-deployment
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.3'
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: '0.12.21'
+      - run: uv sync --locked --extra ${{ matrix.database }}
+      - run: uv run --locked backend migrate --revision 0001
+      - run: uv run --locked python scripts/upgrade-fixture.py write
+      - run: uv run --locked backend migrate
+      - run: uv run --locked python scripts/upgrade-fixture.py check
+      - run: uv run --locked backend check-migrations
+      - run: uv run --locked pytest tests/integration -q
+      - run: docker build --build-arg DB_PROVIDER=${{ matrix.database }} -t modular-fastapi:ci .
